@@ -1,1 +1,110 @@
-<?php /** * SDP Monitor API - MINIMAL PHP 5.4 COMPATIBLE VERSION * Tested and verified for PHP 5.4.16 * NO modern syntax - only PHP 5.4 features */ // Error reporting for debugging (remove in production) error_reporting(E_ALL); ini_set('display_errors', 0); ini_set('log_errors', 1); header('Content-Type: application/json'); header('Access-Control-Allow-Origin: *'); header('Access-Control-Allow-Methods: GET'); header('Cache-Control: no-cache, must-revalidate'); $db_file = dirname(__FILE__) . '/data/sdp_monitor.db'; // Check database exists if (!file_exists($db_file)) { http_response_code(500); die(json_encode(array('error' => 'Database not found', 'path' => $db_file))); } // Connect to database try { $db = new PDO('sqlite:' . $db_file); $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION); } catch (PDOException $e) { http_response_code(500); die(json_encode(array('error' => 'Database connection failed', 'message' => $e->getMessage()))); } // Get action $action = 'dashboard'; if (isset($_GET['action'])) { $action = $_GET['action']; } // Route to functions if ($action === 'dashboard') { $result = getDashboardData($db); echo json_encode($result); } elseif ($action === 'alarms') { $limit = 20; if (isset($_GET['limit'])) { $limit = (int)$_GET['limit']; } $result = getRecentAlarms($db, $limit); echo json_encode($result); } elseif ($action === 'sdp_status') { $result = getSDPStatus($db); echo json_encode($result); } elseif ($action === 'trees') { $result = getTreeList($db); echo json_encode($result); } elseif ($action === 'diagnostic') { $result = getDiagnosticData($db); echo json_encode($result); } elseif ($action === 'sdp_alarms') { $sdp = isset($_GET['sdp']) ? $_GET['sdp'] : ''; $result = getSDPAlarms($db, $sdp); echo json_encode($result); } else { http_response_code(400); echo json_encode(array('error' => 'Invalid action')); } /** * Get dashboard data */ function getDashboardData($db) { // Get latest run try { $stmt = $db->query("SELECT * FROM monitoring_runs ORDER BY run_timestamp DESC LIMIT 1"); $latest_run = $stmt->fetch(PDO::FETCH_ASSOC); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } if (!$latest_run) { return array('error' => 'No monitoring data available'); } $run_id = $latest_run['run_id']; // Get alarm distribution $alarm_dist = null; try { $stmt = $db->prepare("SELECT * FROM alarm_distribution WHERE run_id = ?"); $stmt->execute(array($run_id)); $alarm_dist = $stmt->fetch(PDO::FETCH_ASSOC); } catch (Exception $e) { // Continue without alarm distribution } // Get recent alarms $recent_alarms = array(); try { $stmt = $db->prepare("SELECT * FROM alarms WHERE run_id = ? AND status = 'Active' ORDER BY alarm_id DESC LIMIT 10"); $stmt->execute(array($run_id)); $recent_alarms = $stmt->fetchAll(PDO::FETCH_ASSOC); } catch (Exception $e) { // Continue without alarms } // Get 7-day trend $trend_detail = array(); try { $stmt = $db->query(" SELECT DATE(mr.run_timestamp) as date, COALESCE(ad.config_mismatch_count, 0) as config_mismatch, COALESCE(ad.low_files_count, 0) as low_files FROM monitoring_runs mr LEFT JOIN alarm_distribution ad ON mr.run_id = ad.run_id WHERE mr.run_timestamp >= datetime('now', '-7 days') ORDER BY date "); $trend_detail = $stmt->fetchAll(PDO::FETCH_ASSOC); } catch (Exception $e) { // Continue without trend } // Format dates for chart $dates = array(); $config_mismatches = array(); $low_files_array = array(); if (count($trend_detail) > 0) { foreach ($trend_detail as $row) { $dates[] = date('M j', strtotime($row['date'])); $config_mismatches[] = (int)$row['config_mismatch']; $low_files_array[] = (int)$row['low_files']; } } // Fill to 7 days while (count($dates) < 7) { $days_ago = 7 - count($dates); array_unshift($dates, date('M j', strtotime('-' . $days_ago . ' days'))); array_unshift($config_mismatches, 0); array_unshift($low_files_array, 0); } // Format alarms $formatted_alarms = array(); foreach ($recent_alarms as $alarm) { // Format SDP display: show count in table, keep full list for popup $sdp_display = $alarm['sdp_list']; if ($alarm['sdp_count'] > 1 && strpos($alarm['sdp_list'], ',') !== false) { // Multiple SDPs with actual list - show count $sdp_display = $alarm['sdp_count'] . ' SDPs'; } $formatted_alarms[] = array( 'time' => date('H:i', strtotime($alarm['timestamp'])), 'severity' => $alarm['severity'], 'sdp' => $sdp_display, 'sdp_count' => (int)$alarm['sdp_count'], 'sdp_list' => $alarm['sdp_list'], // Full list for popup 'tree' => $alarm['tree_name'], 'category' => $alarm['category_name'], 'issue' => $alarm['issue_description'], 'status' => $alarm['status'] ); } // Extract alarm distribution counts (PHP 5.4 compatible) $critical_count = 0; $config_mismatch_count = 0; $version_diff_count = 0; $low_files_count = 0; if ($alarm_dist !== null && is_array($alarm_dist)) { if (isset($alarm_dist['critical_count'])) { $critical_count = (int)$alarm_dist['critical_count']; } if (isset($alarm_dist['config_mismatch_count'])) { $config_mismatch_count = (int)$alarm_dist['config_mismatch_count']; } if (isset($alarm_dist['version_diff_count'])) { $version_diff_count = (int)$alarm_dist['version_diff_count']; } if (isset($alarm_dist['low_files_count'])) { $low_files_count = (int)$alarm_dist['low_files_count']; } } // Read total_trees directly from monitoring_runs table $total_trees = (int)$latest_run['total_trees']; // Build response (all array() syntax, no [] shortcuts) return array( 'timestamp' => $latest_run['run_timestamp'], 'stats' => array( 'total_sdps' => (int)$latest_run['total_sdps'], 'responding_sdps' => (int)$latest_run['responding_sdps'], 'total_trees' => $total_trees, 'total_alarms' => (int)$latest_run['total_alarms'], 'avg_response_time' => (float)$latest_run['avg_response_time'] ), 'health' => array( 'healthy' => (int)$latest_run['healthy_sdps'], 'warning' => (int)$latest_run['warning_sdps'], 'critical' => (int)$latest_run['critical_sdps'], 'offline' => (int)$latest_run['offline_sdps'] ), 'alarm_distribution' => array( 'critical' => $critical_count, 'config_mismatch' => $config_mismatch_count, 'version_diff' => $version_diff_count, 'low_files' => $low_files_count ), 'recent_alarms' => $formatted_alarms, 'trend_data' => array( 'dates' => $dates, 'config_mismatches' => $config_mismatches, 'low_files' => $low_files_array ) ); } /** * Get recent alarms */ function getRecentAlarms($db, $limit) { try { $stmt = $db->prepare(" SELECT a.*, mr.run_timestamp FROM alarms a INNER JOIN monitoring_runs mr ON a.run_id = mr.run_id WHERE a.status = 'Active' ORDER BY a.timestamp DESC LIMIT ? "); $stmt->execute(array($limit)); return $stmt->fetchAll(PDO::FETCH_ASSOC); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } } /** * Get SDP status details */ function getSDPStatus($db) { try { // Get latest run ID $stmt = $db->query("SELECT run_id FROM monitoring_runs ORDER BY run_timestamp DESC LIMIT 1"); $run = $stmt->fetch(PDO::FETCH_ASSOC); if (!$run) { return array('error' => 'No monitoring data'); } $run_id = $run['run_id']; // Get SDP status $stmt = $db->prepare(" SELECT sdp_name, is_online, alarm_count, health_status FROM sdp_status WHERE run_id = ? ORDER BY CASE health_status WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 WHEN 'healthy' THEN 3 WHEN 'offline' THEN 4 END, sdp_name "); $stmt->execute(array($run_id)); $sdps = $stmt->fetchAll(PDO::FETCH_ASSOC); // Group by health status $grouped = array( 'healthy' => array(), 'warning' => array(), 'critical' => array(), 'offline' => array() ); foreach ($sdps as $sdp) { $status = $sdp['health_status']; if (isset($grouped[$status])) { $grouped[$status][] = $sdp; } } return array( 'sdps' => $sdps, 'grouped' => $grouped, 'counts' => array( 'healthy' => count($grouped['healthy']), 'warning' => count($grouped['warning']), 'critical' => count($grouped['critical']), 'offline' => count($grouped['offline']) ) ); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } } /** * Get tree list with statistics */ function getTreeList($db) { try { // Get latest run ID $stmt = $db->query("SELECT run_id FROM monitoring_runs ORDER BY run_timestamp DESC LIMIT 1"); $run = $stmt->fetch(PDO::FETCH_ASSOC); if (!$run) { return array('error' => 'No monitoring data'); } $run_id = $run['run_id']; // Try to get from trees table first (v2 schema) $stmt = $db->prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trees'"); $stmt->execute(); $has_trees_table = $stmt->fetch(PDO::FETCH_ASSOC); if ($has_trees_table) { // Use trees table (includes all trees, even without alarms) $stmt = $db->prepare(" SELECT tree_name, total_alarms as alarm_count, total_categories as category_count, affected_sdps FROM trees WHERE run_id = ? ORDER BY total_alarms DESC "); $stmt->execute(array($run_id)); } else { // Fallback to alarms table (old schema) $stmt = $db->prepare(" SELECT tree_name, COUNT(*) as alarm_count, COUNT(DISTINCT category_name) as category_count, COUNT(DISTINCT sdp_list) as affected_sdps FROM alarms WHERE run_id = ? AND tree_name != 'Unknown' GROUP BY tree_name ORDER BY alarm_count DESC "); $stmt->execute(array($run_id)); } $trees = $stmt->fetchAll(PDO::FETCH_ASSOC); return array( 'trees' => $trees, 'total' => count($trees) ); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } } /** * Get diagnostic data - show raw alarm format */ function getDiagnosticData($db) { try { // Get 5 sample alarms $stmt = $db->query(" SELECT alarm_id, tree_name, category_name, severity, sdp_list, issue_description, timestamp FROM alarms WHERE status = 'Active' LIMIT 5 "); $alarms = $stmt->fetchAll(PDO::FETCH_ASSOC); return array( 'sample_alarms' => $alarms, 'note' => 'This shows the exact format of alarm data in your database' ); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } } /** * Get alarms for a specific SDP */ function getSDPAlarms($db, $sdp_name) { try { // Get latest run ID $stmt = $db->query("SELECT run_id FROM monitoring_runs ORDER BY run_timestamp DESC LIMIT 1"); $run = $stmt->fetch(PDO::FETCH_ASSOC); if (!$run) { return array('error' => 'No monitoring data'); } $run_id = $run['run_id']; // Get alarms that mention this SDP $stmt = $db->prepare(" SELECT alarm_id, severity, tree_name, category_name, issue_description, timestamp FROM alarms WHERE run_id = ? AND status = 'Active' AND ( sdp_list LIKE ? OR sdp_list = 'All SDPs' ) ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 END, timestamp DESC "); $stmt->execute(array($run_id, '%' . $sdp_name . '%')); $alarms = $stmt->fetchAll(PDO::FETCH_ASSOC); return array( 'sdp' => $sdp_name, 'alarm_count' => count($alarms), 'alarms' => $alarms ); } catch (Exception $e) { return array('error' => 'Query failed', 'message' => $e->getMessage()); } }
+<?php
+ob_start();
+ini_set('display_errors', '0');
+error_reporting(0);
+
+header('Content-Type: application/json');
+date_default_timezone_set('UTC');
+
+$db_file = dirname(__FILE__) . '/../sdp_monitor.db';
+if (!file_exists($db_file)) {
+    $db_file = dirname(__FILE__) . '/data/sdp_monitor.db';
+}
+
+if (!function_exists('http_response_code')) {
+    function http_response_code($code = NULL) {
+        if ($code !== NULL) {
+            if (isset($_SERVER['SERVER_PROTOCOL'])) $protocol = $_SERVER['SERVER_PROTOCOL'];
+            else $protocol = 'HTTP/1.0';
+            header("$protocol $code");
+            $GLOBALS['http_response_code'] = $code;
+        }
+        return isset($GLOBALS['http_response_code']) ? $GLOBALS['http_response_code'] : 200;
+    }
+}
+
+function send_json($data, $code = 200) {
+    if ($code !== 200) http_response_code($code);
+    ob_clean();
+    echo json_encode($data);
+    exit;
+}
+
+if (!file_exists($db_file)) {
+    send_json(array('error' => "Database not found", 'summary' => null), 404);
+}
+
+try {
+    $db = new PDO("sqlite:$db_file");
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    send_json(array('error' => "Connection failed: " . $e->getMessage()), 500);
+}
+
+$action = isset($_GET['action']) ? $_GET['action'] : 'dashboard';
+
+switch ($action) {
+    case 'dashboard': get_dashboard_summary(); break;
+    case 'alarms': get_alarms(); break;
+    case 'trees': get_trees(); break;
+    case 'sdp_status': get_sdp_status(); break;
+    case 'diagnostic': get_diagnostic(); break;
+    default: send_json(array('error' => "Invalid action"), 400);
+}
+
+function get_dashboard_summary() {
+    global $db;
+    $stmt = $db->query("SELECT *, run_timestamp as last_run FROM monitoring_runs ORDER BY run_id DESC LIMIT 1");
+    $run = $stmt->fetch();
+    
+    if (!$run) {
+        send_json(array(
+            'summary' => array('total_sdps' => 0, 'healthy_sdps' => 0, 'critical_sdps' => 0, 'offline_sdps' => 0, 'total_trees' => 0, 'last_run' => '--'),
+            'recent_alarms' => array(),
+            'history' => array()
+        ));
+    }
+    
+    $stmt = $db->prepare("SELECT alarm_id, timestamp, sdp_list as sdp, severity, issue_description as alarm_text FROM alarms WHERE run_id = ? ORDER BY severity = 'critical' DESC, timestamp DESC LIMIT 10");
+    $stmt->execute(array($run['run_id']));
+    $recent = $stmt->fetchAll();
+    
+    $stmt = $db->query("SELECT date(run_timestamp) as run_time, MAX(total_alarms) as alarm_count FROM monitoring_runs WHERE run_timestamp >= date('now', '-7 days') GROUP BY date(run_timestamp) ORDER BY run_time ASC");
+    $history = $stmt->fetchAll();
+    
+    send_json(array('summary' => $run, 'recent_alarms' => $recent ? $recent : array(), 'history' => $history ? $history : array()));
+}
+
+function get_alarms() {
+    global $db;
+    $stmt = $db->query("SELECT MAX(run_id) FROM monitoring_runs");
+    $run_id = $stmt->fetchColumn();
+    if (!$run_id) send_json(array('alarms' => array()));
+    
+    $stmt = $db->prepare("SELECT alarm_id as id, timestamp, sdp_list as sdp, tree_name as tree, category_name as category, severity, issue_description as alarm_text FROM alarms WHERE run_id = ? ORDER BY severity = 'critical' DESC, timestamp DESC LIMIT 100");
+    $stmt->execute(array($run_id));
+    send_json(array('alarms' => $stmt->fetchAll()));
+}
+
+function get_trees() {
+    global $db;
+    $stmt = $db->query("SELECT tree_name, category_name as category, expected_files, found_files, (expected_files - found_files) as missing_files FROM categories WHERE run_id = (SELECT MAX(run_id) FROM monitoring_runs) ORDER BY alarm_count DESC");
+    $trees = $stmt->fetchAll();
+    send_json(array('trees' => $trees ? $trees : array()));
+}
+
+function get_sdp_status() {
+    global $db;
+    $stmt = $db->query("SELECT *, CASE WHEN health_status != 'offline' THEN 1 ELSE 0 END as is_online FROM sdp_status WHERE run_id = (SELECT MAX(run_id) FROM monitoring_runs) ORDER BY sdp_name ASC");
+    $status = $stmt->fetchAll();
+    send_json(array('sdp_status' => $status ? $status : array()));
+}
+
+function get_diagnostic() {
+    global $db, $db_file;
+    $stats = array('db' => realpath($db_file), 'size' => @filesize($db_file), 'php' => PHP_VERSION, 'time' => date('Y-m-d H:i:s'));
+    $stmt = $db->query("SELECT * FROM monitoring_runs ORDER BY run_id DESC LIMIT 5");
+    $stats['recent_runs'] = $stmt->fetchAll();
+    send_json($stats);
+}

@@ -1,1 +1,103 @@
-#!/bin/bash # db_loader.sh - PRODUCTION - Skips malformed alarms (< 15 chars or no tree) set -e DB_FILE="$HOME/sdp_monitor.db" ALARM_FILE="$HOME/ere_alarms_latest.txt" SCHEMA_FILE="$HOME/database_schema_v2.sql" process_alarm() { local ALARM_TEXT="$1" local AFFECTED_LIST="$2" # Only skip if no tree info (malformed) [[ ! "$ALARM_TEXT" =~ tree\ \[ ]] && return local ALARM_TYPE="unknown" [[ "$ALARM_TEXT" =~ has\ only\ 1\ file ]] && ALARM_TYPE="low_files_1" [[ "$ALARM_TEXT" =~ has\ 0\ files ]] && ALARM_TYPE="low_files_0" [[ "$ALARM_TEXT" =~ (has|have)\ extra\ category ]] && ALARM_TYPE="extra_category" local SDP_PREFIX="" [[ "$ALARM_TEXT" =~ ^([^-]+)\ -\ ]] && SDP_PREFIX=$(echo "${BASH_REMATCH[1]}" | xargs) local TREE="Unknown" [[ "$ALARM_TEXT" =~ tree\ \[([^\]]+)\] ]] && TREE="${BASH_REMATCH[1]}" local CATEGORY="N/A" if [[ "$ALARM_TEXT" =~ category\ \[([^\]]+)\] ]]; then CATEGORY="${BASH_REMATCH[1]}" elif [[ "$ALARM_TEXT" =~ has\ extra\ category\ \[([^\]]+)\] ]]; then CATEGORY="${BASH_REMATCH[1]}" elif [[ "$ALARM_TEXT" =~ have\ extra\ category\ \[([^\]]+)\] ]]; then CATEGORY="${BASH_REMATCH[1]}"; fi local FILE_COUNT=-1 [[ "$ALARM_TEXT" =~ has\ 0\ files ]] && FILE_COUNT=0 [[ "$ALARM_TEXT" =~ has\ only\ 1\ file ]] && FILE_COUNT=1 local SDP_LIST="$SDP_PREFIX" local SDP_COUNT=1 if [ -n "$AFFECTED_LIST" ]; then SDP_LIST="$AFFECTED_LIST"; SDP_COUNT=$(echo "$SDP_LIST" | tr ',' '\n' | grep -c 'SDP') elif [[ "$SDP_PREFIX" =~ ^SDP[0-9]+B$ ]]; then SDP_LIST="$SDP_PREFIX"; SDP_COUNT=1 elif [[ "$SDP_PREFIX" =~ ([0-9]+)\ SDPs? ]]; then SDP_COUNT="${BASH_REMATCH[1]}" elif [[ "$SDP_PREFIX" =~ All ]]; then SDP_COUNT=44; SDP_LIST="All SDPs"; fi local ISSUE="$ALARM_TEXT" local SEVERITY="low" [[ "$ALARM_TEXT" =~ (has|have)\ extra\ category ]] && SEVERITY="high" ISSUE="${ISSUE//\'/\'\'}"; SDP_LIST="${SDP_LIST//\'/\'\'}"; TREE="${TREE//\'/\'\'}"; CATEGORY="${CATEGORY//\'/\'\'}" sqlite3 "$DB_FILE" "INSERT INTO alarms (run_id,severity,alarm_type,sdp_list,sdp_count,tree_name,category_name,file_count,issue_description,status) VALUES ($RUN_ID,'$SEVERITY','$ALARM_TYPE','$SDP_LIST',$SDP_COUNT,'$TREE','$CATEGORY',$FILE_COUNT,'$ISSUE','Active');" ALARM_COUNT=$((ALARM_COUNT+1)) } [ ! -f "$SCHEMA_FILE" ] && { echo "ERROR: Schema not found"; exit 1; } [ ! -f "$ALARM_FILE" ] && { echo "ERROR: Alarm file not found"; exit 1; } sqlite3 "$DB_FILE" < "$SCHEMA_FILE" TOTAL_TREES=18; STATS_FILE=$(ls -t "$HOME"/sdp_stats_*.txt 2>/dev/null | head -1) [ -f "$STATS_FILE" ] && TOTAL_TREES=$(grep "^Total Trees:" "$STATS_FILE" | awk '{print $3}' | tr -d ' \t\n\r'); TOTAL_TREES=${TOTAL_TREES:-18} CRITICAL_ALARMS=$(grep -c "missing tree\|SSH failed" "$ALARM_FILE" 2>/dev/null || echo 0); CRITICAL_ALARMS=$(echo "$CRITICAL_ALARMS" | tr -d ' \t\n\r') CONFIG_MISMATCH=$(grep -c "extra category" "$ALARM_FILE" 2>/dev/null || echo 0); CONFIG_MISMATCH=$(echo "$CONFIG_MISMATCH" | tr -d ' \t\n\r') LOW_FILES=$(grep -c "has only 1 file\|has 0 files" "$ALARM_FILE" 2>/dev/null || echo 0); LOW_FILES=$(echo "$LOW_FILES" | tr -d ' \t\n\r') TOTAL_ALARMS=$(grep -c "^\[ALARM\]" "$ALARM_FILE" 2>/dev/null || echo 0); TOTAL_ALARMS=$(echo "$TOTAL_ALARMS" | tr -d ' \t\n\r') OFFLINE=0; CRITICAL_SDPS=0; WARNING_SDPS=0; HEALTHY_SDPS=0 for sdp in SDP{27..70}B; do SDP_ALARMS=$(grep -c "$sdp" "$ALARM_FILE" 2>/dev/null || echo 0); SDP_ALARMS=$(echo "$SDP_ALARMS" | tr -d ' \t\n\r') if grep -q "$sdp.*SSH failed" "$ALARM_FILE" 2>/dev/null; then OFFLINE=$((OFFLINE+1)) elif [ "$SDP_ALARMS" -ge 5 ]; then CRITICAL_SDPS=$((CRITICAL_SDPS+1)) elif [ "$SDP_ALARMS" -ge 1 ]; then WARNING_SDPS=$((WARNING_SDPS+1)) else HEALTHY_SDPS=$((HEALTHY_SDPS+1)); fi done TOTAL_SDPS=$((OFFLINE+CRITICAL_SDPS+WARNING_SDPS+HEALTHY_SDPS)); RESPONDING_SDPS=$((TOTAL_SDPS-OFFLINE)) RUN_ID=$(sqlite3 "$DB_FILE" "INSERT INTO monitoring_runs (run_timestamp,total_sdps,responding_sdps,offline_sdps,total_alarms,total_trees,avg_response_time,healthy_sdps,warning_sdps,critical_sdps) VALUES (datetime('now'),$TOTAL_SDPS,$RESPONDING_SDPS,$OFFLINE,$TOTAL_ALARMS,$TOTAL_TREES,0.0,$HEALTHY_SDPS,$WARNING_SDPS,$CRITICAL_SDPS); SELECT last_insert_rowid();") sqlite3 "$DB_FILE" "INSERT INTO alarm_distribution (run_id,critical_count,config_mismatch_count,version_diff_count,low_files_count) VALUES ($RUN_ID,$CRITICAL_ALARMS,$CONFIG_MISMATCH,0,$LOW_FILES);" ALARM_COUNT=0; CURRENT_ALARM=""; CURRENT_AFFECTED=""; SKIPPED=0 while IFS= read -r line || [ -n "$line" ]; do if [[ "$line" =~ ^\[ALARM\]\ (.+)$ ]]; then if [ -n "$CURRENT_ALARM" ]; then BEFORE=$ALARM_COUNT process_alarm "$CURRENT_ALARM" "$CURRENT_AFFECTED" [ $ALARM_COUNT -eq $BEFORE ] && { SKIPPED=$((SKIPPED+1)); echo "SKIP: $CURRENT_ALARM" >&2; } fi CURRENT_ALARM="${BASH_REMATCH[1]}"; CURRENT_AFFECTED="" elif [[ "$line" =~ ^[[:space:]]+Affected:[[:space:]]*(.+)$ ]]; then CURRENT_AFFECTED="${BASH_REMATCH[1]}"; fi done < "$ALARM_FILE" if [ -n "$CURRENT_ALARM" ]; then BEFORE=$ALARM_COUNT process_alarm "$CURRENT_ALARM" "$CURRENT_AFFECTED" [ $ALARM_COUNT -eq $BEFORE ] && { SKIPPED=$((SKIPPED+1)); echo "SKIP: $CURRENT_ALARM" >&2; } fi sqlite3 "$DB_FILE" "INSERT INTO trees (run_id,tree_name,total_categories,total_alarms,affected_sdps,health_status) SELECT run_id,tree_name,COUNT(DISTINCT category_name),COUNT(*),SUM(sdp_count),CASE WHEN SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END)>0 THEN 'critical' WHEN SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END)>0 THEN 'warning' ELSE 'healthy' END FROM alarms WHERE run_id=(SELECT MAX(run_id) FROM monitoring_runs) AND tree_name!='Unknown' GROUP BY run_id,tree_name;" for sdp in SDP{27..70}B; do IS_ONLINE=1; ALARM_COUNT_SDP=$(grep -c "$sdp" "$ALARM_FILE" 2>/dev/null || echo 0); ALARM_COUNT_SDP=$(echo "$ALARM_COUNT_SDP" | tr -d ' \t\n\r'); HEALTH="healthy" if grep -q "$sdp.*SSH failed" "$ALARM_FILE" 2>/dev/null; then IS_ONLINE=0; HEALTH="offline" elif [ "$ALARM_COUNT_SDP" -ge 5 ]; then HEALTH="critical" elif [ "$ALARM_COUNT_SDP" -ge 1 ]; then HEALTH="warning"; fi sqlite3 "$DB_FILE" "INSERT INTO sdp_status (run_id,sdp_name,is_online,alarm_count,health_status) VALUES ($RUN_ID,'$sdp',$IS_ONLINE,$ALARM_COUNT_SDP,'$HEALTH');" done echo "? Database loaded: $ALARM_COUNT alarms inserted ($SKIPPED skipped)"
+#!/bin/bash
+# db_loader.sh - Definitive Legacy Loader (v7)
+# Hardened against all known failure modes on legacy systems.
+
+set -e
+DB_FILE="$HOME/sdp_monitor.db"
+ALARM_FILE="$HOME/ere_alarms_latest.txt"
+STATS_FILE="$HOME/ere_stats_latest.txt"
+ST_FILE="$HOME/sdp_status_latest.txt"
+SCHEMA_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/migrations/001_initial_schema.sql"
+TMP_SQL="$HOME/ere_db_load.sql"
+
+# 1. Initialize/Migrate Schema
+if [ ! -s "$DB_FILE" ]; then
+    echo "Initializing new database..."
+    sqlite3 "$DB_FILE" < "$SCHEMA_FILE"
+else
+    # Robust Migration for ip_address column
+    echo "Checking schema integrity..."
+    sqlite3 "$DB_FILE" "ALTER TABLE sdp_status ADD COLUMN ip_address TEXT;" 2>/dev/null || true
+fi
+
+# 2. Extract Stats Robustly (Handles labels with or without spaces/indentation)
+get_stat() {
+    if [ -f "$STATS_FILE" ]; then
+        # Use grep -i and strip everything but the final number
+        grep -i "$1" "$STATS_FILE" | sed 's/.*[:=] *//; s/[^0-9]//g' | head -1
+    else
+        echo 0
+    fi
+}
+
+T_TREES=$(get_stat "Trees")
+T_SDPS=$(get_stat "TotalSDPs")
+[ "$T_SDPS" == "0" ] && T_SDPS=$(get_stat "Total SDPs")
+R_SDPS=$(get_stat "Responding")
+H_SDPS=$(get_stat "Healthy")
+W_SDPS=$(get_stat "Warning")
+C_SDPS=$(get_stat "Critical")
+O_SDPS=$(get_stat "Offline")
+T_ALARMS=$(get_stat "Alarms")
+[ "$T_ALARMS" == "0" ] && T_ALARMS=$(grep -c "^\[ALARM\]" "$ALARM_FILE" || echo 0)
+
+# 3. Build SQL with Mandatory Escaping
+escape_sql() {
+    echo "$1" | sed "s/'/''/g"
+}
+
+{
+    echo "BEGIN TRANSACTION;"
+    echo "INSERT INTO monitoring_runs (run_timestamp, total_sdps, responding_sdps, total_trees, total_alarms, healthy_sdps, warning_sdps, critical_sdps, offline_sdps) VALUES (datetime('now'), '${T_SDPS:-0}', '${R_SDPS:-0}', '${T_TREES:-0}', '${T_ALARMS:-0}', '${H_SDPS:-0}', '${W_SDPS:-0}', '${C_SDPS:-0}', '${O_SDPS:-0}');"
+    echo "CREATE TEMPORARY TABLE _run_id AS SELECT last_insert_rowid() AS id;"
+
+    # Process Alarms
+    if [ -f "$ALARM_FILE" ]; then
+        while read -r line; do
+            if [[ "$line" =~ ^\[ALARM\]\ (.+)$ ]]; then
+                RAW_TXT="${BASH_REMATCH[1]}"
+                TXT=$(escape_sql "$RAW_TXT")
+                SEV="low"
+                [[ "$RAW_TXT" =~ missing\ tree ]] && SEV="critical"
+                [[ "$RAW_TXT" =~ SSH\ failed ]] && SEV="critical"
+                
+                TREE=""; [[ "$RAW_TXT" =~ tree\ \[([^\]]+)\] ]] && TREE=$(escape_sql "${BASH_REMATCH[1]}")
+                CAT=""; [[ "$RAW_TXT" =~ category\ \[([^\]]+)\] ]] && CAT=$(escape_sql "${BASH_REMATCH[1]}")
+                SDP=""; [[ "$RAW_TXT" =~ ^([^-]+)\ - ]] && SDP=$(escape_sql "${BASH_REMATCH[1]}")
+                
+                echo "INSERT INTO alarms (run_id, severity, sdp_list, tree_name, category_name, issue_description) VALUES ((SELECT id FROM _run_id), '$SEV', '$SDP', '$TREE', '$CAT', '$TXT');"
+            elif [[ "$line" =~ ^\ Affected:\ (.+)$ ]]; then
+                HOSTS=$(escape_sql "${BASH_REMATCH[1]}")
+                echo "UPDATE alarms SET sdp_list = '$HOSTS' WHERE alarm_id = last_insert_rowid();"
+            fi
+        done < "$ALARM_FILE"
+    fi
+
+    # Process SDP Status
+    if [ -f "$ST_FILE" ]; then
+        while IFS=',' read -r h ip hs || [ -n "$h" ]; do
+            if [ -n "$h" ]; then
+                H_ESC=$(escape_sql "$h")
+                IP_ESC=$(escape_sql "$ip")
+                HS_ESC=$(escape_sql "$hs")
+                echo "INSERT INTO sdp_status (run_id, sdp_name, ip_address, health_status) VALUES ((SELECT id FROM _run_id), '$H_ESC', '$IP_ESC', '$HS_ESC');"
+            fi
+        done < "$ST_FILE"
+    fi
+
+    # Aggregations
+    echo "INSERT INTO categories (run_id, tree_name, category_name, alarm_count) SELECT (SELECT id FROM _run_id), tree_name, category_name, COUNT(*) FROM alarms WHERE run_id=(SELECT id FROM _run_id) AND tree_name != '' AND category_name != '' GROUP BY tree_name, category_name;"
+    echo "INSERT INTO trees (run_id, tree_name, alarm_count) SELECT (SELECT id FROM _run_id), tree_name, COUNT(*) FROM alarms WHERE run_id=(SELECT id FROM _run_id) AND tree_name != '' GROUP BY tree_name;"
+    echo "COMMIT;"
+} > "$TMP_SQL"
+
+# 4. Execute
+echo "Loading database..."
+if sqlite3 "$DB_FILE" < "$TMP_SQL"; then
+    echo "Database load complete."
+    rm -f "$TMP_SQL"
+else
+    echo "ERROR: Data load failed. SQLite reported issues."
+    echo "Check the generated SQL at $TMP_SQL for errors."
+    exit 1
+fi
