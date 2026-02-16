@@ -1,0 +1,307 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                  ERE_MONITOR PRODUCTION DEPLOYMENT STEPS                       ║
+║                          Quick Reference Guide                                 ║
+║                         Version 2.0 (2026-02-16)                              ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+PHASE 1: SETUP (10-15 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. CREATE SERVICE ACCOUNT & DIRECTORIES
+────────────────────────────────────────
+sudo useradd -m -d /var/opt/ere-monitor -s /bin/bash sdpmonitor
+sudo mkdir -p /var/opt/ere-monitor/{config,scripts,database,logs,backup}
+sudo chown -R sdpmonitor:sdpmonitor /var/opt/ere-monitor
+sudo chmod 750 /var/opt/ere-monitor
+
+2. GENERATE SSH KEYS
+────────────────────
+sudo -u sdpmonitor ssh-keygen -t rsa -b 4096 -N "" -f /var/opt/ere-monitor/.ssh/id_rsa
+sudo chmod 700 /var/opt/ere-monitor/.ssh
+sudo chmod 600 /var/opt/ere-monitor/.ssh/id_rsa
+
+3. DISTRIBUTE PUBLIC KEY TO ALL SDPs
+─────────────────────────────────────
+Public key: cat /var/opt/ere-monitor/.ssh/id_rsa.pub
+On each SDP: echo "public_key" >> /home/sdpuser/.ssh/authorized_keys
+
+
+PHASE 2: DEPLOY FILES (5-10 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+4. DEPLOY MONITORING SCRIPTS
+──────────────────────────────
+From repository:
+sudo cp SDP_Script/ere_monitor_fast.sh /var/opt/ere-monitor/scripts/
+sudo cp SDP_Script/run_complete_monitoring.sh /var/opt/ere-monitor/scripts/
+sudo cp SDP_Script/db_loader.sh /var/opt/ere-monitor/scripts/
+
+Set permissions:
+sudo chmod 750 /var/opt/ere-monitor/scripts/*.sh
+sudo chown sdpmonitor:sdpmonitor /var/opt/ere-monitor/scripts/*.sh
+
+5. DEPLOY DATABASE SCHEMA
+─────────────────────────
+sudo cp SDP_Script/database_schema_v2.sql /var/opt/ere-monitor/database/
+sudo chown sdpmonitor:sdpmonitor /var/opt/ere-monitor/database/database_schema_v2.sql
+
+6. DEPLOY WEB DASHBOARD
+───────────────────────
+sudo mkdir -p /var/www/html/sdp-monitor/data
+sudo cp SDP_Script/sdp-monitor/api.php /var/www/html/sdp-monitor/
+sudo cp SDP_Script/sdp-monitor/index.html /var/www/html/sdp-monitor/
+sudo cp SDP_Script/sdp-monitor/tree-analysis.html /var/www/html/sdp-monitor/
+sudo cp SDP_Script/sdp-monitor/diagnostic.html /var/www/html/sdp-monitor/
+sudo cp SDP_Script/sdp-monitor/chart.min.js /var/www/html/sdp-monitor/
+
+Set permissions:
+sudo chown -R apache:apache /var/www/html/sdp-monitor
+sudo chmod 755 /var/www/html/sdp-monitor
+sudo chmod 755 /var/www/html/sdp-monitor/data
+sudo chmod 644 /var/www/html/sdp-monitor/*.{html,js,php}
+
+
+PHASE 3: CONFIGURATION (5-10 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+7. CREATE SDP INVENTORY FILE (CRITICAL)
+────────────────────────────────────────
+vi /var/opt/ere-monitor/config/sdp.config
+
+Content format:
+───────────────
+Hostname,IP
+SDP27B,192.168.1.27
+SDP28B,192.168.1.28
+SDP29B,192.168.1.29
+...
+SDP70B,192.168.1.70
+
+Set permissions:
+sudo chown sdpmonitor:sdpmonitor /var/opt/ere-monitor/config/sdp.config
+sudo chmod 640 /var/opt/ere-monitor/config/sdp.config
+
+8. TEST SSH CONNECTIVITY (IMPORTANT)
+─────────────────────────────────────
+As sdpmonitor user:
+sudo -u sdpmonitor ssh -i ~/.ssh/id_rsa sdpuser@SDP27B "echo SSH OK"
+
+Repeat for at least 3 different SDPs.
+
+9. INITIALIZE DATABASE
+──────────────────────
+sudo -u sdpmonitor bash << 'EOF'
+export DB_FILE="/var/www/html/sdp-monitor/data/sdp_monitor.db"
+export SCHEMA_FILE="/var/opt/ere-monitor/database/database_schema_v2.sql"
+sqlite3 "$DB_FILE" < "$SCHEMA_FILE"
+EOF
+
+Verify database was created:
+ls -lh /var/www/html/sdp-monitor/data/sdp_monitor.db
+
+10. CONFIGURE WEB SERVER (Apache example)
+──────────────────────────────────────────
+Create /etc/httpd/conf.d/sdp-monitor.conf:
+
+<VirtualHost *:80>
+    ServerName sdp-monitor.example.com
+    DocumentRoot /var/www/html/sdp-monitor
+
+    <Directory /var/www/html/sdp-monitor>
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    <Files "*.php">
+        SetHandler "proxy:unix:/run/php-fpm.sock|fcgi://localhost"
+    </Files>
+
+    ErrorLog /var/log/httpd/sdp-monitor-error.log
+    CustomLog /var/log/httpd/sdp-monitor-access.log combined
+</VirtualHost>
+
+Reload Apache:
+sudo systemctl reload httpd
+
+
+PHASE 4: TESTING (5-10 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+11. RUN FIRST MONITORING CYCLE
+───────────────────────────────
+sudo -u sdpmonitor /var/opt/ere-monitor/scripts/run_complete_monitoring.sh
+
+Expected output:
+✓ Collecting from reference: SDP27B
+✓ Found X trees on reference
+✓ Collecting data in parallel...
+✓ Database loaded: X alarms inserted
+
+12. VERIFY DATABASE HAS DATA
+──────────────────────────────
+sqlite3 /var/www/html/sdp-monitor/data/sdp_monitor.db << 'EOF'
+SELECT COUNT(*) as run_count FROM monitoring_runs;
+SELECT COUNT(*) as alarm_count FROM alarms;
+SELECT * FROM v_latest_alarms LIMIT 3;
+EOF
+
+13. TEST API ENDPOINT
+──────────────────────
+curl -s http://localhost/sdp-monitor/api.php?action=dashboard | head -c 100
+
+Expected: JSON response starting with '{"timestamp":'
+
+14. VERIFY WEB DASHBOARD
+─────────────────────────
+Open browser and navigate to:
+http://your-server/sdp-monitor/index.html
+
+Should show:
+✓ Dashboard with stats
+✓ SDP list
+✓ Alarm summary
+✓ Trend chart
+
+
+PHASE 5: AUTOMATION (5 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+15. SETUP CRON JOBS
+────────────────────
+Edit crontab:
+sudo -u sdpmonitor crontab -e
+
+Add these lines:
+
+# Monitor every 5 minutes (or adjust frequency)
+*/5 * * * * /var/opt/ere-monitor/scripts/run_complete_monitoring.sh >> /var/opt/ere-monitor/logs/ere_monitor.cron.log 2>&1
+
+# Backup database daily at 2 AM
+0 2 * * * cp /var/www/html/sdp-monitor/data/sdp_monitor.db /var/opt/ere-monitor/backup/sdp_monitor.db.backup.$(date +\%Y\%m\%d)
+
+# Clean old backups (keep 30 days)
+0 3 * * * find /var/opt/ere-monitor/backup -name "*.backup.*" -mtime +30 -delete
+
+16. VERIFY CRON EXECUTION
+───────────────────────────
+# Wait for first cron cycle (up to 5 minutes)
+sleep 300
+
+# Check logs
+tail -20 /var/opt/ere-monitor/logs/ere_monitor.cron.log
+
+# Verify database updated
+sqlite3 /var/www/html/sdp-monitor/data/sdp_monitor.db \
+  "SELECT run_timestamp FROM monitoring_runs ORDER BY run_timestamp DESC LIMIT 1;"
+
+
+PHASE 6: SECURITY (5 minutes)
+═══════════════════════════════════════════════════════════════════════════════
+
+17. RESTRICT FILE PERMISSIONS
+──────────────────────────────
+sudo chmod 640 /var/www/html/sdp-monitor/data/sdp_monitor.db
+sudo chmod 640 /var/opt/ere-monitor/config/sdp.config
+
+18. CONFIGURE FIREWALL
+──────────────────────
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --reload
+
+19. ENABLE SELINUX CONTEXT (if applicable)
+────────────────────────────────────────────
+sudo semanage fcontext -a -t httpd_sys_rw_content_t "/var/www/html/sdp-monitor/data(/.*)?"
+sudo restorecon -Rv /var/www/html/sdp-monitor
+
+
+DEPLOYMENT VERIFICATION CHECKLIST
+═══════════════════════════════════════════════════════════════════════════════
+
+[ ] Service account created (sdpmonitor)
+[ ] Directory structure created under /var/opt/ere-monitor
+[ ] SSH keys generated and distributed
+[ ] SSH connectivity verified to all SDPs
+[ ] Monitoring scripts deployed and executable
+[ ] Database schema deployed
+[ ] Web dashboard deployed
+[ ] SDP inventory configured (sdp.config)
+[ ] Database initialized with schema
+[ ] Apache/Nginx configured and running
+[ ] API endpoint responds with JSON
+[ ] Dashboard accessible via browser
+[ ] First monitoring cycle completed successfully
+[ ] Cron jobs configured
+[ ] File permissions set correctly
+[ ] Firewall configured
+[ ] Backup strategy implemented
+
+
+QUICK HEALTH CHECK COMMANDS
+═══════════════════════════════════════════════════════════════════════════════
+
+Check cron execution:
+sudo tail -20 /var/opt/ere-monitor/logs/ere_monitor.cron.log
+
+Check database size:
+du -h /var/www/html/sdp-monitor/data/sdp_monitor.db
+
+Check latest alarms:
+sqlite3 /var/www/html/sdp-monitor/data/sdp_monitor.db \
+  "SELECT issue_description FROM alarms LIMIT 5;"
+
+Check SDP status:
+sqlite3 /var/www/html/sdp-monitor/data/sdp_monitor.db \
+  "SELECT sdp_name, health_status FROM sdp_status ORDER BY health_status;"
+
+Monitor script performance:
+time /var/opt/ere-monitor/scripts/ere_monitor_fast.sh /var/opt/ere-monitor/config/sdp.config
+
+
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════════
+
+Problem: SSH connection timeouts
+──────────────────────────────────
+Check SSH directly:
+ssh -v -i /var/opt/ere-monitor/.ssh/id_rsa sdpuser@SDP27B
+
+Problem: "Database locked" error
+─────────────────────────────────
+Check for stuck processes:
+lsof /var/www/html/sdp-monitor/data/sdp_monitor.db
+
+Problem: No data in dashboard
+──────────────────────────────
+Verify cron ran: tail /var/opt/ere-monitor/logs/ere_monitor.cron.log
+Check database: sqlite3 /var/www/html/sdp-monitor/data/sdp_monitor.db ".tables"
+Review Apache: tail /var/log/httpd/error_log
+
+Problem: API returns error
+──────────────────────────
+Check database exists:
+ls -l /var/www/html/sdp-monitor/data/sdp_monitor.db
+
+Check database permissions:
+ls -l /var/www/html/sdp-monitor/data/
+
+Check PHP extensions:
+php -m | grep PDO
+
+
+SUPPORT & ESCALATION
+═══════════════════════════════════════════════════════════════════════════════
+
+Documentation: See PRODUCTION_DEPLOYMENT.md for complete details
+Configuration: See PRODUCTION_FILES_MANIFEST.md for file locations
+Monitoring: Check logs in /var/opt/ere-monitor/logs/
+Database: SQLite database at /var/www/html/sdp-monitor/data/sdp_monitor.db
+
+For additional support, refer to the main PRODUCTION_DEPLOYMENT.md guide.
+
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  DEPLOYMENT COMPLETE                                                          ║
+║  System is now monitoring SDP infrastructure                                  ║
+║  Dashboard available at: http://your-server/sdp-monitor/index.html          ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
